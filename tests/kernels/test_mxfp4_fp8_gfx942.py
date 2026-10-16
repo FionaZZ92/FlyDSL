@@ -7,9 +7,11 @@ Run from the repository root on ROCm:
   python -m pytest tests/kernels/test_mxfp4_fp8_gfx942.py -m 'not benchmark'
   python -m pytest tests/kernels/test_mxfp4_fp8_gfx942.py -m benchmark -s
 
-Benchmarks use random packed weights, without E8M0 scales or GEMM. Logical
+Benchmarks use random packed weights, with optional E8M0 scales, without GEMM. Logical
 gate_up is [E, 4096, 6144]; down is [E, 6144, 2048]. Packed input halves K.
 E=8 is a contiguous group, E=48 assumes EP=8/TP=1, and E=384 is one layer.
+E=62 is a contiguous group of complete experts (TP=1). Scaled benchmarks
+use synthetic E8M0 codes 123..131; correctness covers all 256 encodings.
 The largest case needs about 14 GiB of free GPU memory.
 """
 
@@ -23,7 +25,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import T
-from kernels.moe.mxfp4_fp8_gfx942 import fp4_to_fp8x8
+from kernels.moe.mxfp4_fp8_gfx942 import compile_mxfp4_to_fp8, fp4_to_fp8x8, mxfp4_to_fp8
 from kernels.moe.mxfp_moe.mxfp4_gemm_common import global_typed_ptr
 
 pytestmark = [
@@ -65,12 +67,17 @@ def _make_launch(words, *, fnuz=True):
     return launch
 
 
-def _expected_bytes(words, *, fnuz):
+def _expected_bytes(words, *, fnuz, scales=None):
     # Decode numerically, independently of the kernel's byte-permute tables.
     table = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], device=words.device)
     codes = (words.to(torch.int64)[:, None] >> (torch.arange(8, device=words.device) * 4)) & 15
     dtype = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
-    return table[codes].to(dtype).view(torch.uint8)
+    values = table[codes]
+    if scales is not None:
+        factors = torch.exp2(scales.float() - 127)
+        factors = torch.where(scales == 255, float("nan"), factors)
+        values = values * factors[:, None]
+    return values.to(dtype).view(torch.uint8)
 
 
 @pytest.mark.parametrize("fnuz", [True, False], ids=["fnuz", "fn"])
@@ -100,7 +107,7 @@ def test_fp4_to_fp8x8(fnuz, pattern):
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
 
-def _check_weight_samples(src, dst, *, fnuz, generator):
+def _check_weight_samples(src, dst, *, fnuz, generator, scales=None):
     words = src.numel() // 4
     ids = torch.cat(
         (
@@ -109,34 +116,98 @@ def _check_weight_samples(src, dst, *, fnuz, generator):
             torch.randint(words, (65536,), device="cuda", generator=generator),
         )
     )
-    expected = _expected_bytes(src.view(torch.int32).flatten()[ids], fnuz=fnuz)
-    torch.testing.assert_close(dst.view(-1, 8)[ids], expected, rtol=0, atol=0)
+    sampled_scales = scales.flatten()[ids // 4] if scales is not None else None
+    expected = _expected_bytes(src.view(torch.int32).flatten()[ids], fnuz=fnuz, scales=sampled_scales)
+    torch.testing.assert_close(dst.view(torch.uint8).view(-1, 8)[ids], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fnuz", [True, False], ids=["fnuz", "fn"])
+def test_scaled_all_codes(fnuz):
+    """All E8M0 encodings crossed with every packed byte at every position."""
+    byte = torch.arange(256, dtype=torch.int64)
+    words = torch.cat([(byte << (8 * p)) | (0x87654321 & ~(255 << (8 * p))) for p in range(4)])
+    words = words.to(torch.int32).repeat(256, 1)
+    scales = torch.arange(256, dtype=torch.uint8)[:, None].expand(256, 256).contiguous()
+    src, gpu_scales = words.cuda(), scales.cuda()
+    out = torch.empty((src.numel(), 8), dtype=torch.uint8, device="cuda")
+    launch = compile_mxfp4_to_fp8(groups=scales.numel(), fnuz=fnuz)
+    launch(src.data_ptr(), gpu_scales.data_ptr(), out.data_ptr(), torch.cuda.current_stream())
+    expected = _expected_bytes(words.flatten(), fnuz=fnuz, scales=scales.flatten().repeat_interleave(4))
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 32), (2, 7, 96), (3, 17, 160), (3, 17, 192)])
+def test_scaled_weight_conversion(shape):
+    e, n, k = shape
+    generator = torch.Generator().manual_seed(731)
+    src = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, generator=generator).cuda()
+    scales = torch.randint(115, 136, (e, n, k // 32), dtype=torch.uint8, generator=generator).cuda()
+    actual = mxfp4_to_fp8(src, scales)
+    fnuz = actual.dtype == torch.float8_e4m3fnuz
+    expected = _expected_bytes(
+        src.cpu().view(torch.int32).flatten(), fnuz=fnuz, scales=scales.cpu().flatten().repeat_interleave(4)
+    )
+    torch.testing.assert_close(actual.view(torch.uint8).cpu().view(-1, 8), expected, rtol=0, atol=0)
+    # Guard words catch writes beyond a partial final thread block.
+    storage = torch.full((actual.numel() + 8,), 85, dtype=torch.uint8, device="cuda")
+    out = storage[4:-4].view(actual.dtype).reshape(shape)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mxfp4_to_fp8(src, scales, out=out)
+    graph.replay()
+    torch.testing.assert_close(out.view(torch.uint8).cpu().view(-1, 8), expected, rtol=0, atol=0)
+    assert torch.all(storage[:4] == 85) and torch.all(storage[-4:] == 85)
+
+
+def test_scaled_invalid_inputs():
+    src = torch.zeros((1, 2, 32), dtype=torch.uint8, device="cuda")
+    scales = torch.full((1, 2, 2), 127, dtype=torch.uint8, device="cuda")
+    with pytest.raises(TypeError, match="uint8"):
+        mxfp4_to_fp8(src.float(), scales)
+    with pytest.raises(ValueError, match="scales"):
+        mxfp4_to_fp8(src, scales[:, :, :1].contiguous())
+    with pytest.raises(ValueError, match="contiguous"):
+        mxfp4_to_fp8(src.transpose(1, 2), scales)
+    with pytest.raises(ValueError, match="K divisible"):
+        mxfp4_to_fp8(torch.zeros((1, 1, 17), dtype=torch.uint8, device="cuda"), scales)
+    with pytest.raises(ValueError, match="out must"):
+        mxfp4_to_fp8(src, scales, out=torch.empty((1, 2, 64), dtype=torch.float32, device="cuda"))
 
 
 @pytest.mark.benchmark
 @pytest.mark.large_shape
-@pytest.mark.parametrize("experts", [1, 8, 48, 384])
+@pytest.mark.parametrize("experts", [1, 8, 48, 62, 384])
+@pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
 @pytest.mark.parametrize("projection,n,k", [("gate_up", 4096, 6144), ("down", 6144, 2048)])
-def test_mimo_weight_conversion_benchmark(experts, projection, n, k):
+def test_mimo_weight_conversion_benchmark(experts, projection, n, k, scaled):
     arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
     fnuz = arch == "gfx942"
     count = experts * n * k
     # Leave room for reference samples, runtime workspaces and the flush buffer.
-    if torch.cuda.mem_get_info()[0] < count * 3 // 2 + 1024**3:
+    traffic = count * 3 // 2 + (count // 32 if scaled else 0)
+    if torch.cuda.mem_get_info()[0] < traffic + 1024**3:
         pytest.skip("Insufficient free GPU memory for this weight shape")
     generator = torch.Generator(device="cuda").manual_seed(20261016)
     src = torch.randint(0, 256, (experts, n, k // 2), dtype=torch.uint8, device="cuda", generator=generator)
     dst = torch.empty((experts, n, k), dtype=torch.uint8, device="cuda")
+    scales = None
+    if scaled:
+        # Synthetic scales 2**[-4,4], with finite, exactly representable output.
+        scales = torch.randint(123, 132, (experts, n, k // 32), dtype=torch.uint8, device="cuda", generator=generator)
     flush = torch.zeros(512 * 1024**2, dtype=torch.uint8, device="cuda")
-    launch = _make_launch(count // 8, fnuz=fnuz)
+    launch = compile_mxfp4_to_fp8(groups=count // 32, fnuz=fnuz) if scaled else _make_launch(count // 8, fnuz=fnuz)
 
     def run():
-        launch(src.data_ptr(), dst.data_ptr(), torch.cuda.current_stream())
+        if scaled:
+            launch(src.data_ptr(), scales.data_ptr(), dst.data_ptr(), torch.cuda.current_stream())
+        else:
+            launch(src.data_ptr(), dst.data_ptr(), torch.cuda.current_stream())
 
     for _ in range(5):
         run()
     torch.cuda.synchronize()
-    _check_weight_samples(src, dst, fnuz=fnuz, generator=generator)
+    _check_weight_samples(src, dst, fnuz=fnuz, generator=generator, scales=scales)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -145,7 +216,7 @@ def test_mimo_weight_conversion_benchmark(experts, projection, n, k):
     dst.fill_(255)
     graph.replay()
     torch.cuda.synchronize()
-    _check_weight_samples(src, dst, fnuz=fnuz, generator=generator)
+    _check_weight_samples(src, dst, fnuz=fnuz, generator=generator, scales=scales)
 
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     hot = []
@@ -167,11 +238,11 @@ def test_mimo_weight_conversion_benchmark(experts, projection, n, k):
         end.record()
         end.synchronize()
         cold.append(start.elapsed_time(end) * 1000)
-    _check_weight_samples(src, dst, fnuz=fnuz, generator=generator)
+    _check_weight_samples(src, dst, fnuz=fnuz, generator=generator, scales=scales)
 
     hot_us, cold_us = statistics.median(hot), statistics.median(cold)
-    cold_tbps = (count * 3 // 2) / cold_us / 1e6
+    cold_tbps = traffic / cold_us / 1e6
     print(
-        f"\n{arch} E={experts} {projection} logical=[{experts},{n},{k}] "
+        f"\n{arch} E={experts} {projection} scaled={scaled} logical=[{experts},{n},{k}] "
         f"repeated_us={hot_us:.3f} flushed_us={cold_us:.3f} flushed_TBps={cold_tbps:.3f}"
     )
