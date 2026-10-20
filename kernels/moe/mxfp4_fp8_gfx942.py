@@ -51,15 +51,17 @@ def fp4_to_fp8x8(raw_i32, *, fnuz=True):
     return fx.Vector.from_elements([_raw(p0), _raw(p1)], fx.Int32).bitcast(dtype)
 
 
-def _scaled_fp8_tables(scale_code, *, fnuz):
-    """Build an eight-byte magnitude LUT for E2M1 * 2**(scale_code-127).
+def _scaled_fp8_tables(scale_code, *, fnuz, exponent_offset=0):
+    """Build a magnitude LUT for E2M1 * 2**(scale_code-127-exponent_offset).
 
     E8M0 scaling shifts the FP8 exponent exactly. Only subnormal outputs
     need rounding. Building the LUT once per 32-value block reuses this work for
     all 32 weights and avoids unsupported generic FP8 casts on gfx942.
     """
     code = fx.Int32(scale_code) & fx.Int32(255)
-    delta = code - fx.Int32(127)
+    # Keep the relative exponent signed: per-channel normalization can push
+    # it below the E8M0 encoding range. Mask only the original input byte.
+    delta = code - fx.Int32(127) - fx.Int32(exponent_offset)
     nan_code = 128 if fnuz else 127
     invalid = code == fx.Int32(255)
     lut = [invalid.select(fx.Int32(nan_code), fx.Int32(0))]
